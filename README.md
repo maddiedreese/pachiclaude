@@ -16,7 +16,7 @@ The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislo
 
 ## Status
 
-Camera capture, reel cropping and stop detection work. Symbol matching, the WebSocket bridge and the terminal app are next.
+Camera capture, stop detection, finding the reels after the camera moves, and reading the symbols work. The WebSocket bridge and the terminal app are next.
 
 ## Setup
 
@@ -33,7 +33,7 @@ python3 -m venv .venv
 .venv/bin/python capture_4k.py
 ```
 
-The script finds the camera that delivers native 3840x2160, waits ~2s for exposure, and saves `reels_4k_full.jpg`, a 1280px preview, and one crop per reel (`reel_1.png`–`reel_3.png`) using the boxes in `reels.json`. The camera's digital zoom is never used; if the tripod moves, update `reels.json`.
+The script finds the camera that delivers native 3840x2160, waits ~2s for exposure, and saves `reels_4k_full.jpg`, a 1280px preview, and one crop per reel (`reel_1.png`–`reel_3.png`) using the boxes in `reels.json`. The camera's digital zoom is never used.
 
 Run it from a terminal app that has camera access (System Settings → Privacy & Security → Camera). Close Photo Booth, OBS or Camera Hub first if one of them is holding the camera.
 
@@ -43,7 +43,7 @@ Run it from a terminal app that has camera access (System Settings → Privacy &
 .venv/bin/python reel_watch.py
 ```
 
-Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SETTLED` once they've all stopped, saving that frame's reel crops to `captures/<timestamp>/` (these become the symbol templates). A spin starts once every reel's frame-to-frame difference has been above `--spin` (default 8) for `--start-frames` (3) frames in a row, and a reel counts as stopped after `--still-frames` (4) frames below `--still` (3).
+Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SETTLED` once they've all stopped, then the nine symbols it read and an `OUTCOME` line. The settled frame and its reel crops are saved to `captures/<timestamp>/`. A spin starts once every reel's frame-to-frame difference has been above `--spin` (default 8) for `--start-frames` (3) frames in a row, and a reel counts as stopped after `--still-frames` (4) frames below `--still` (3).
 
 Guards stop camera bumps and lamp flashes from counting as motion:
 
@@ -51,12 +51,46 @@ Guards stop camera bumps and lamp flashes from counting as motion:
 - Reels only restart on a lever pull, so if a reel that already stopped seems to move mid-spin, the reel lamps are flashing for a win. Those frames are held the same way (`FLASH`).
 - A spin that settles within `--min-spin` seconds (1.0) of starting prints `FALSE SPIN` and is ignored.
 
-If the tripod moves, update the reference box along with the reel boxes.
-
 Add `--verbose` to print the per-reel and reference differences and tune those against the real machine, or `--video clip.mov` to run on a recording.
 
-`test_reel_watch.py` checks the detector on synthetic spins, bumps and lamp flashes, and replays the real `--verbose` logs in `fixtures/`:
+## Find the reels
+
+The camera drifts: over one afternoon it moved up to 48px between captures. So the boxes in `reels.json` are only right for the calibration frame, and `align.py` finds the reels in every new frame from the anchors in `anchors/`: the cabinet around the reels, with the symbol areas and video screen masked out, plus where each reel sat in it. It searches ±150px at quarter scale, refines at full scale, then matches each reel's rim within ±12px to absorb a slight tilt; the best-matching anchor wins. A match counts from 0.45 if it also beats every other spot more than 20px away by 0.1; otherwise the reels are lost and the spin is a misread.
+
+The reel lamps change how the cabinet looks: the lamps-off calibration anchor scores about 0.54 on lamps-on frames, and an anchor taken with the lamps on scores 0.95. So after a spin where the reels were found, add that frame's lighting:
 
 ```bash
-.venv/bin/python test_reel_watch.py
+.venv/bin/python align.py add-anchor captures/<timestamp>/frame.jpg
+```
+
+To recalibrate (after moving the camera on purpose, or if `couldn't find the reels` shows up): capture a frame, set the boxes in `reels.json` so each covers one reel window with three whole symbols, and the reference box on the gold figure, then
+
+```bash
+.venv/bin/python align.py calibrate     # replaces everything in anchors/
+.venv/bin/python align.py               # where the reels are in reels_4k_full.jpg now
+```
+
+## Read the symbols
+
+```bash
+.venv/bin/python read_reels.py reels_4k_full.jpg          # find and read a whole frame
+.venv/bin/python read_reels.py captures/<timestamp>       # read saved crops
+```
+
+Each reel shows three rows. Every cell is matched against labelled examples in `templates/` as chroma (colour with brightness divided out), so it still reads with the reel lamps off or flashing. A cell counts only if its best symbol scores at least 0.6 and beats the next symbol by 0.15; anything less is unreadable and the whole spin is a misread (spin again), never a guess. 7s and BAR also have to agree on plain lightness, because three of them auto-approves 5 calls.
+
+Payouts are checked on five lines: the three rows and both diagonals.
+
+To teach it a symbol it gets wrong or doesn't know, label a capture's nine cells reel by reel, top to bottom (`red7 blue7 bar replay bell watermelon cherry`):
+
+```bash
+.venv/bin/python read_reels.py learn captures/<timestamp> bell watermelon red7 cherry bell replay watermelon bar replay
+```
+
+## Tests
+
+```bash
+.venv/bin/python test_reel_watch.py   # stop detection: synthetic spins, bumps, flashes, real logs
+.venv/bin/python test_align.py        # finding the reels after moves, tilts and relighting
+.venv/bin/python test_read_reels.py   # labelled captures in fixtures/reels/ and the payline rules
 ```

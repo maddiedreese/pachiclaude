@@ -18,6 +18,10 @@ appears to move mid-spin: reels only restart on a lever pull, so that's the
 reel lamps flashing for a win. And a spin that settles less than --min-spin
 seconds after it started is reported as a false spin instead of settling.
 
+At startup and on every settle the reels are located with align.py (so the
+boxes follow the camera if it moves) and read with read_reels.py, printing
+the nine symbols and the outcome. The settled frame is saved next to the crops.
+
 Reads the Facecam by default, or a recorded clip with --video. Use --verbose
 to print the per-reel differences and tune the thresholds.
 """
@@ -30,6 +34,8 @@ import time
 import cv2
 import numpy as np
 
+import align
+import read_reels
 from capture_4k import REELS_CONFIG, find_camera
 
 SAMPLE_SIZE = (32, 40)  # (w, h) each reel crop is shrunk to before diffing
@@ -64,6 +70,12 @@ class Region:
         self.moving_count = 0
         self.diff = 0.0
 
+    def move_to(self, box):
+        if tuple(box) != tuple(self.box):
+            self.box = tuple(box)
+            self.prev = None
+            self.diff = 0.0
+
     def measure(self, frame):
         cur = sample(frame, self.box)
         if self.prev is not None:
@@ -93,6 +105,15 @@ class ReelWatcher:
         self.frame_index = -1
         self.shaking = False
         self.flashing = False
+
+    def move_to(self, found):
+        """Follow the camera: use the boxes align.locate() found."""
+        for reel, (_, box) in zip(self.reels, found["reels"]):
+            reel.move_to(box)
+        self.reference.move_to(found["reference"])
+
+    def boxes(self):
+        return [(r.id, r.box) for r in self.reels]
 
     def update(self, frame):
         self.reference.measure(frame)
@@ -165,7 +186,46 @@ def save_settled(frame, boxes):
     for reel_id, (x0, y0, x1, y1) in boxes:
         cv2.imwrite(os.path.join(out, f"reel_{reel_id}.png"),
                     frame[y0:y1, x0:x1])
+    cv2.imwrite(os.path.join(out, "frame.jpg"), frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 90])
     return out
+
+
+class Reader:
+    """Finds and reads the reels; without anchors it falls back to the fixed
+    boxes in reels.json."""
+
+    def __init__(self):
+        self.cfg = align.load_config()
+        self.anchors = align.load_anchors()
+        if not self.anchors:
+            print(f"No anchors in {align.ANCHORS_DIR}/: using fixed boxes. "
+                  "Run `align.py calibrate` so they follow the camera.")
+        self.templates = read_reels.load_templates()
+        if not self.templates:
+            print(f"No templates in {read_reels.TEMPLATES_DIR}/: every spin "
+                  "will be a misread.")
+
+    def locate(self, frame, watcher):
+        """Move the watcher's boxes onto the reels. False if they're lost."""
+        if not self.anchors:
+            return True
+        found = align.locate(frame, self.cfg, self.anchors)
+        if found is None:
+            return False
+        watcher.move_to(found)
+        return True
+
+    def read(self, frame, watcher):
+        """Return (outcome, reason, grid or None)."""
+        if not self.templates:
+            return "misread", "no templates", None
+        if not self.locate(frame, watcher):
+            return "misread", "couldn't find the reels; recalibrate", None
+        crops = [frame[y0:y1, x0:x1] for _, (x0, y0, x1, y1) in watcher.boxes()]
+        grid = read_reels.read_grid(crops, self.templates)
+        result, reason = read_reels.outcome(read_reels.symbols_only(grid))
+        return result, reason, grid
 
 
 def open_source(video):
@@ -210,12 +270,19 @@ def main():
     watcher = ReelWatcher(boxes, load_reference(), args.spin, args.still,
                           args.still_frames, args.start_frames, args.shake,
                           args.min_spin, fps)
+    reader = Reader()
     print("Watching reels (Ctrl-C to quit)")
+    first = True
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+            if first:
+                first = False
+                if not reader.locate(frame, watcher):
+                    print("Couldn't find the reels: using the boxes in "
+                          "reels.json. Recalibrate if the camera moved.")
             events = watcher.update(frame)
             if args.verbose:
                 print("  ".join(f"r{r.id}:{r.diff:5.1f}{'*' if r.spinning else ' '}"
@@ -229,10 +296,14 @@ def main():
                 elif event[0] == "stop":
                     print(f"  reel {event[1]} stopped")
                 elif event[0] == "settled":
+                    result, reason, grid = reader.read(frame, watcher)
                     msg = "SETTLED"
                     if not args.no_save:
-                        msg += f" -> {save_settled(frame, boxes)}"
+                        msg += f" -> {save_settled(frame, watcher.boxes())}"
                     print(msg)
+                    if grid:
+                        print(read_reels.format_grid(grid))
+                    print(f"OUTCOME {result} ({reason})")
                 elif event[0] == "false_spin":
                     print("FALSE SPIN (too short, ignored)")
     except KeyboardInterrupt:
