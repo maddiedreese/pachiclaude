@@ -47,7 +47,7 @@ Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SET
 
 Guards stop camera bumps and lamp flashes from counting as motion:
 
-- `reels.json` has a `reference` box on a static part of the cabinet (the gold figure left of reel 1). While its difference is above `--shake` (4) the camera itself moved, so reels can't start or stop on those frames (`SHAKE` in `--verbose`).
+- `reels.json` has a `reference` box on a static part of the cabinet (the gold figure left of reel 1). While its difference is above `--shake` (2.5) the camera itself moved, so reels can't start or stop on those frames (`SHAKE` in `--verbose`).
 - Reels only restart on a lever pull, so if a reel that already stopped seems to move mid-spin, the reel lamps are flashing for a win. Those frames are held the same way (`FLASH`).
 - A spin that settles within `--min-spin` seconds (1.0) of starting prints `FALSE SPIN` and is ignored.
 

@@ -69,11 +69,11 @@ def events(log):
     return [e for _, e in log]
 
 
-def replay(path):
+def replay(path, **kwargs):
     """Feed a saved --verbose log through ReelWatcher.step()."""
     line_re = re.compile(r"r1:\s*([\d.]+)\*?\s+r2:\s*([\d.]+)\*?\s+"
                          r"r3:\s*([\d.]+)\*?\s+ref:\s*([\d.]+)")
-    watcher = ReelWatcher(load_boxes(), load_reference(), fps=FPS)
+    watcher = ReelWatcher(load_boxes(), load_reference(), fps=FPS, **kwargs)
     log = []
     t = 0
     with open(path) as f:
@@ -128,12 +128,24 @@ def main():
     assert events(log) == [("spin",), ("stop", 1), ("stop", 2), ("stop", 3),
                            ("settled",)], log
 
-    # The real spin from 2026-10-24: lever pull, stops 1-2-3, then the win's
-    # reel-lamp flashes. Each reel must stop exactly once, in order.
-    log = replay("fixtures/spin_replay_win_20261024.txt")
-    print("real win:  ", log)
-    assert events(log) == [("spin",), ("stop", 1), ("stop", 2), ("stop", 3),
-                           ("settled",)], log
+    # Real spins from 2026-10-24, two ending in a win's reel-lamp flashes
+    # (during the last stop, and just after settling): each reel must stop
+    # exactly once, in order, and the flashes must not start another spin.
+    for path in ("fixtures/spin_replay_win_20261024.txt",
+                 "fixtures/spin_nowin_20261024.txt",
+                 "fixtures/spin_win_flash_after_settle_20261024.txt"):
+        log = replay(path)
+        print("real spin: ", log)
+        assert events(log) == [("spin",), ("stop", 1), ("stop", 2),
+                               ("stop", 3), ("settled",)], log
+
+    # A real knock on the cabinet: the camera rings for a second. No events,
+    # even without the start_frames rule to fall back on.
+    log = replay("fixtures/knock_20261024.txt")
+    print("real knock:", log)
+    assert log == [], log
+    log = replay("fixtures/knock_20261024.txt", start_frames=1)
+    assert log == [], log
     print("ok")
 
 

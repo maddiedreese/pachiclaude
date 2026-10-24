@@ -79,7 +79,7 @@ class ReelWatcher:
     """
 
     def __init__(self, boxes, reference, spin=8.0, still=3.0, still_frames=4,
-                 start_frames=3, shake=4.0, min_spin=1.0, fps=30.0):
+                 start_frames=3, shake=2.5, min_spin=1.0, fps=30.0):
         self.reels = [Region(i, b) for i, b in boxes]
         self.reference = Region("ref", reference)
         self.spin = spin
@@ -194,7 +194,7 @@ def main():
                    help="consecutive still frames before a reel is stopped")
     p.add_argument("--start-frames", type=int, default=3,
                    help="consecutive moving frames on every reel to start a spin")
-    p.add_argument("--shake", type=float, default=4.0,
+    p.add_argument("--shake", type=float, default=2.5,
                    help="reference diff above which the camera itself moved")
     p.add_argument("--min-spin", type=float, default=1.0,
                    help="seconds a spin must last to count")
