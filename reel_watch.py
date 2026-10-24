@@ -4,10 +4,19 @@ whole spin settles.
 
 Motion is measured per reel as the mean absolute difference between
 consecutive frames of that reel's crop (grayscale, blurred, downscaled so
-sensor noise averages out). A reel is spinning once the difference jumps above
---spin, and stopped once it stays below --still for --still-frames frames in a
-row. When every reel that spun has stopped, the settled frame's reel crops are
-saved to captures/<timestamp>/ for symbol matching.
+sensor noise averages out). A spin starts once every reel's difference has
+been above --spin for --start-frames frames in a row, and a reel is stopped
+once its difference stays below --still for --still-frames frames in a row.
+When every reel has stopped, the settled frame's reel crops are saved to
+captures/<timestamp>/ for symbol matching.
+
+Guards keep bumps and lamp flashes from counting as motion. A reference box
+on the cabinet (reels.json "reference") never moves on its own, so while its
+difference is above --shake the camera itself moved: reels can't start or
+stop on those frames. The same hold applies when a reel that already stopped
+appears to move mid-spin: reels only restart on a lever pull, so that's the
+reel lamps flashing for a win. And a spin that settles less than --min-spin
+seconds after it started is reported as a false spin instead of settling.
 
 Reads the Facecam by default, or a recorded clip with --video. Use --verbose
 to print the per-reel differences and tune the thresholds.
@@ -32,6 +41,11 @@ def load_boxes(path=REELS_CONFIG):
         return [(r["id"], tuple(r["box"])) for r in json.load(f)["reels"]]
 
 
+def load_reference(path=REELS_CONFIG):
+    with open(path) as f:
+        return tuple(json.load(f)["reference"]["box"])
+
+
 def sample(frame, box):
     x0, y0, x1, y1 = box
     gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
@@ -40,54 +54,108 @@ def sample(frame, box):
     return small.astype(np.float32)
 
 
-class Reel:
+class Region:
     def __init__(self, reel_id, box):
         self.id = reel_id
         self.box = box
         self.prev = None
         self.spinning = False
         self.still_count = 0
+        self.moving_count = 0
         self.diff = 0.0
+
+    def measure(self, frame):
+        cur = sample(frame, self.box)
+        if self.prev is not None:
+            self.diff = float(np.mean(np.abs(cur - self.prev)))
+        self.prev = cur
 
 
 class ReelWatcher:
     """Feed frames in order; update() returns the events each frame caused.
 
-    Events are tuples: ("spin",), ("stop", reel_id) and ("settled",).
+    Events are tuples: ("spin",), ("stop", reel_id), and then ("settled",)
+    or, for a spin shorter than min_spin seconds, ("false_spin",).
     """
 
-    def __init__(self, boxes, spin=8.0, still=3.0, still_frames=6):
-        self.reels = [Reel(i, b) for i, b in boxes]
+    def __init__(self, boxes, reference, spin=8.0, still=3.0, still_frames=4,
+                 start_frames=3, shake=4.0, min_spin=1.0, fps=30.0):
+        self.reels = [Region(i, b) for i, b in boxes]
+        self.reference = Region("ref", reference)
         self.spin = spin
         self.still = still
         self.still_frames = still_frames
+        self.start_frames = start_frames
+        self.shake = shake
+        self.min_spin_frames = round(min_spin * fps)
         self.in_spin = False
+        self.spin_start = 0
+        self.frame_index = -1
+        self.shaking = False
+        self.flashing = False
 
     def update(self, frame):
+        self.reference.measure(frame)
+        for reel in self.reels:
+            reel.measure(frame)
+        return self.step([r.diff for r in self.reels], self.reference.diff)
+
+    def step(self, diffs, ref_diff):
+        """Advance one frame given each reel's diff and the reference diff."""
+        self.frame_index += 1
+        self.reference.diff = ref_diff
+        for reel, diff in zip(self.reels, diffs):
+            reel.diff = diff
+
+        self.shaking = ref_diff > self.shake
+        # Reels only start on a lever pull, so a reel that already stopped
+        # this spin can't really move: the reel lamps flashed (win effects).
+        self.flashing = self.in_spin and any(
+            not r.spinning and r.diff > self.still for r in self.reels)
+        if self.shaking or self.flashing:
+            # Every reel looks like it moved. Hold all states and make
+            # stopping reels prove stillness afresh.
+            for reel in self.reels:
+                reel.still_count = 0
+                reel.moving_count = 0
+            return []
+
+        if not self.in_spin:
+            # A lever pull starts all reels together and keeps them moving;
+            # lamp flashes last a frame or two.
+            for reel in self.reels:
+                reel.moving_count = (reel.moving_count + 1
+                                     if reel.diff > self.spin else 0)
+            if all(r.moving_count >= self.start_frames for r in self.reels):
+                self.in_spin = True
+                self.spin_start = self.frame_index - self.start_frames + 1
+                for reel in self.reels:
+                    reel.spinning = True
+                    reel.still_count = 0
+                return [("spin",)]
+            return []
+
         events = []
         for reel in self.reels:
-            cur = sample(frame, reel.box)
-            if reel.prev is not None:
-                reel.diff = float(np.mean(np.abs(cur - reel.prev)))
-            reel.prev = cur
-
+            if not reel.spinning:
+                continue
             if reel.diff > self.spin:
                 reel.still_count = 0
-                if not reel.spinning:
-                    reel.spinning = True
-                    if not self.in_spin:
-                        self.in_spin = True
-                        events.append(("spin",))
             elif reel.diff < self.still:
                 reel.still_count += 1
-                if reel.spinning and reel.still_count >= self.still_frames:
+                if reel.still_count >= self.still_frames:
                     reel.spinning = False
                     events.append(("stop", reel.id))
             # Between the thresholds: hold the current state.
 
-        if self.in_spin and not any(r.spinning for r in self.reels):
+        if not any(r.spinning for r in self.reels):
             self.in_spin = False
-            events.append(("settled",))
+            for reel in self.reels:
+                reel.moving_count = 0
+            if self.frame_index - self.spin_start < self.min_spin_frames:
+                events.append(("false_spin",))
+            else:
+                events.append(("settled",))
         return events
 
 
@@ -122,8 +190,14 @@ def main():
                    help="diff above which a reel counts as spinning")
     p.add_argument("--still", type=float, default=3.0,
                    help="diff below which a reel counts as still")
-    p.add_argument("--still-frames", type=int, default=6,
+    p.add_argument("--still-frames", type=int, default=4,
                    help="consecutive still frames before a reel is stopped")
+    p.add_argument("--start-frames", type=int, default=3,
+                   help="consecutive moving frames on every reel to start a spin")
+    p.add_argument("--shake", type=float, default=4.0,
+                   help="reference diff above which the camera itself moved")
+    p.add_argument("--min-spin", type=float, default=1.0,
+                   help="seconds a spin must last to count")
     p.add_argument("--no-save", action="store_true",
                    help="don't write settled reel crops to captures/")
     p.add_argument("--verbose", action="store_true",
@@ -131,8 +205,11 @@ def main():
     args = p.parse_args()
 
     boxes = load_boxes()
-    watcher = ReelWatcher(boxes, args.spin, args.still, args.still_frames)
     cap = open_source(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    watcher = ReelWatcher(boxes, load_reference(), args.spin, args.still,
+                          args.still_frames, args.start_frames, args.shake,
+                          args.min_spin, fps)
     print("Watching reels (Ctrl-C to quit)")
     try:
         while True:
@@ -142,7 +219,10 @@ def main():
             events = watcher.update(frame)
             if args.verbose:
                 print("  ".join(f"r{r.id}:{r.diff:5.1f}{'*' if r.spinning else ' '}"
-                                for r in watcher.reels))
+                                for r in watcher.reels)
+                      + f"  ref:{watcher.reference.diff:5.1f}"
+                      + ("  SHAKE" if watcher.shaking else "")
+                      + ("  FLASH" if watcher.flashing else ""))
             for event in events:
                 if event[0] == "spin":
                     print("SPIN")
@@ -153,6 +233,8 @@ def main():
                     if not args.no_save:
                         msg += f" -> {save_settled(frame, boxes)}"
                     print(msg)
+                elif event[0] == "false_spin":
+                    print("FALSE SPIN (too short, ignored)")
     except KeyboardInterrupt:
         pass
     finally:

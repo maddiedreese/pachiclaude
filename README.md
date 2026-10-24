@@ -43,9 +43,19 @@ Run it from a terminal app that has camera access (System Settings → Privacy &
 .venv/bin/python reel_watch.py
 ```
 
-Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SETTLED` once they've all stopped, saving that frame's reel crops to `captures/<timestamp>/` (these become the symbol templates). A reel counts as moving when its frame-to-frame difference goes above `--spin` (default 8) and as stopped after `--still-frames` (6) frames below `--still` (3). Add `--verbose` to print the per-reel differences and tune those against the real machine, or `--video clip.mov` to run on a recording.
+Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SETTLED` once they've all stopped, saving that frame's reel crops to `captures/<timestamp>/` (these become the symbol templates). A spin starts once every reel's frame-to-frame difference has been above `--spin` (default 8) for `--start-frames` (3) frames in a row, and a reel counts as stopped after `--still-frames` (4) frames below `--still` (3).
 
-`test_reel_watch.py` checks the detector on synthetic spins:
+Guards stop camera bumps and lamp flashes from counting as motion:
+
+- `reels.json` has a `reference` box on a static part of the cabinet (the gold figure left of reel 1). While its difference is above `--shake` (4) the camera itself moved, so reels can't start or stop on those frames (`SHAKE` in `--verbose`).
+- Reels only restart on a lever pull, so if a reel that already stopped seems to move mid-spin, the reel lamps are flashing for a win. Those frames are held the same way (`FLASH`).
+- A spin that settles within `--min-spin` seconds (1.0) of starting prints `FALSE SPIN` and is ignored.
+
+If the tripod moves, update the reference box along with the reel boxes.
+
+Add `--verbose` to print the per-reel and reference differences and tune those against the real machine, or `--video clip.mov` to run on a recording.
+
+`test_reel_watch.py` checks the detector on synthetic spins, bumps and lamp flashes, and replays the real `--verbose` logs in `fixtures/`:
 
 ```bash
 .venv/bin/python test_reel_watch.py
