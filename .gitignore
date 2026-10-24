@@ -5,3 +5,6 @@ __pycache__/
 reels_4k_full.jpg
 reels_4k_preview.jpg
 reel_[0-9].png
+
+# Settled reel crops from reel_watch.py
+captures/

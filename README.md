@@ -16,7 +16,7 @@ The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislo
 
 ## Status
 
-Camera capture and reel cropping work. Stop detection, symbol matching, the WebSocket bridge and the terminal app are next.
+Camera capture, reel cropping and stop detection work. Symbol matching, the WebSocket bridge and the terminal app are next.
 
 ## Setup
 
@@ -36,3 +36,17 @@ python3 -m venv .venv
 The script finds the camera that delivers native 3840x2160, waits ~2s for exposure, and saves `reels_4k_full.jpg`, a 1280px preview, and one crop per reel (`reel_1.png`–`reel_3.png`) using the boxes in `reels.json`. The camera's digital zoom is never used; if the tripod moves, update `reels.json`.
 
 Run it from a terminal app that has camera access (System Settings → Privacy & Security → Camera). Close Photo Booth, OBS or Camera Hub first if one of them is holding the camera.
+
+## Watch spins
+
+```bash
+.venv/bin/python reel_watch.py
+```
+
+Prints `SPIN` when the reels start, `reel N stopped` as each one halts, and `SETTLED` once they've all stopped, saving that frame's reel crops to `captures/<timestamp>/` (these become the symbol templates). A reel counts as moving when its frame-to-frame difference goes above `--spin` (default 8) and as stopped after `--still-frames` (6) frames below `--still` (3). Add `--verbose` to print the per-reel differences and tune those against the real machine, or `--video clip.mov` to run on a recording.
+
+`test_reel_watch.py` checks the detector on synthetic spins:
+
+```bash
+.venv/bin/python test_reel_watch.py
+```
