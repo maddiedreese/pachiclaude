@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+
+# Camera captures and per-reel crops (commit a crop only when it's needed, e.g. as a template)
+reels_4k_full.jpg
+reels_4k_preview.jpg
+reel_[0-9].png
