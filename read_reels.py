@@ -151,15 +151,20 @@ def read_grid(crops, templates):
 def outcome(grid):
     """Map a grid of symbols (grid[reel][row], None = unreadable) to
     (outcome, reason)."""
+    return evaluate(grid)[:2]
+
+
+def evaluate(grid):
+    """(outcome, reason, paying line name or None) for a grid."""
     if any(s is None for reel in grid for s in reel):
-        return "misread", "a symbol couldn't be read"
+        return "misread", "a symbol couldn't be read", None
     for want, result in LINE_OUTCOMES:
         for name, rows in LINES.items():
             if tuple(grid[r][rows[r]] for r in range(3)) == want:
-                return result, f"{want[0]} on the {name} line"
+                return result, f"{want[0]} on the {name} line", name
     if "cherry" in grid[0]:
-        return "approve_roast", "cherry on reel 1"
-    return "deny", "no win"
+        return "approve_roast", "cherry on reel 1", None
+    return "deny", "no win", None
 
 
 def read_frame(frame, cfg, anchor, templates):

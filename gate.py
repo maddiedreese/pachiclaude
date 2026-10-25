@@ -1,15 +1,25 @@
 """Turn slot machine outcomes into Claude Code permission decisions.
 
-Gate.can_use_tool is the Agent SDK's permission callback: for every tool call
-Claude Code asks about, it waits for the next spin that starts after the
-request, reads the outcome off the bridge, and allows or denies the call.
-Replays and misreads mean spin again; YOLO approves this call and the next
-YOLO_CALLS without a spin.
+One spin per prompt: Gate.spin_for_turn waits for the next spin that starts
+after the user submits a prompt (replays and misreads mean spin again) and
+sets what Claude may do until the next prompt. Gate.can_use_tool, the Agent
+SDK's permission callback, then answers every request that turn straight
+from that outcome:
+
+    approve, approve_roast   everything is allowed
+    yolo                     everything, and the next YOLO_PROMPTS prompts
+                             skip the spin
+    deny_tests               only test files and test runs ("write tests first")
+    deny                     nothing that needs permission
+
+prompt_for() tells Claude every turn what this spin allows, so it doesn't try
+things that will be denied, and doesn't think an earlier denial still holds.
 """
 import asyncio
 import json
 import os
 import random
+import re
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from websockets.asyncio.client import connect
@@ -17,35 +27,58 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from bridge import PROTOCOL
 
-YOLO_CALLS = 5
+YOLO_PROMPTS = 5
 
 ROASTS = (
     "Approved. A cherry, like the one on top of this pile of untested code.",
     "Approved, but the machine has seen your commit history.",
     "Approved. Even the reels think this needed a second look.",
-    "Approved. Bold of you to gamble on this diff.",
+    "Approved. Bold of you to gamble on this prompt.",
     "Approved. The cherry is the only thing here that's ripe.",
 )
 
-DENY_MESSAGE = ("The pachislot machine that approves tool calls missed, so "
-                "this {tool} call was denied. You can try again (that's "
-                "another spin) or take a different approach.")
-TESTS_MESSAGE = ("The pachislot machine landed on watermelon: write tests "
-                 "first. Add or update tests that cover this change before "
-                 "trying this {tool} call again.")
+ALLOW = ("approve", "approve_roast", "yolo")
+RETRY = ("replay", "misread")
+
+DENY_MESSAGE = ("The pachislot machine that approves tool calls missed for "
+                "this prompt, so you can't change files or run commands until "
+                "the user's next prompt. Don't get it done through a "
+                "different tool; do what you can without it.")
+TESTS_MESSAGE = ("The pachislot machine landed on watermelon for this prompt: "
+                 "write tests first. Until the user's next prompt you may only "
+                 "create or edit test files and run tests.")
+APPROVED_NOTE = ("[The pachislot machine that approves your tool calls approved "
+                 "this prompt: you may write files and run commands as needed, "
+                 "whatever earlier prompts allowed.]")
+NOTES = {  # put in front of every prompt so Claude knows before it starts
+    "approve": APPROVED_NOTE,
+    "approve_roast": APPROVED_NOTE,
+    "yolo": APPROVED_NOTE,
+    "deny": ("[The pachislot machine that approves your tool calls missed for "
+             "this prompt: you can read files, but writing files and running "
+             "commands will be denied. Do what you can without them.]"),
+    "deny_tests": ("[The pachislot machine that approves your tool calls "
+                   "landed on watermelon for this prompt: write tests first. "
+                   "You may only create or edit test files and run tests; "
+                   "other edits and commands will be denied.]"),
+}
+
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|"
+                       r"_test\.[^/]+$|\.(test|spec)\.[^/]+$")
+TEST_COMMAND = re.compile(r"^\s*(\S*python3?\s+-m\s+(pytest|unittest)|pytest|"
+                          r"npm\s+(run\s+)?test|yarn\s+test|pnpm\s+test|"
+                          r"npx\s+(jest|vitest)|jest|vitest|go\s+test|"
+                          r"cargo\s+test)\b")
 
 
-def decide(outcome):
-    """Map a machine outcome to ("allow" | "deny" | "retry", note)."""
-    if outcome in ("yolo", "approve"):
-        return "allow", None
-    if outcome == "approve_roast":
-        return "allow", random.choice(ROASTS)
-    if outcome == "deny_tests":
-        return "deny", TESTS_MESSAGE
-    if outcome == "deny":
-        return "deny", DENY_MESSAGE
-    return "retry", None  # replay, misread, or anything unknown
+def is_test_call(tool_name, tool_input):
+    """Whether a call only touches tests: editing a test file, or running a
+    test command with nothing chained after it."""
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        return bool(TEST_COMMAND.match(command)) and not re.search(r"[;&|`$<>]", command)
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    return bool(path) and bool(TEST_PATH.search(path))
 
 
 def describe(tool_name, tool_input, cwd=None):
@@ -151,53 +184,72 @@ class Gate:
         self.machine = machine
         self.ui = ui
         self.cwd = cwd
-        self.yolo_left = 0
-        self._lock = asyncio.Lock()  # one spin decides one call
+        self.outcome = None    # this turn's outcome; None until a spin
+        self.yolo_left = 0     # prompts that skip the spin
+        self._waiting = None   # the queue of a spin in progress
 
-    async def can_use_tool(self, tool_name, tool_input, context):
-        async with self._lock:
-            summary = describe(tool_name, tool_input, self.cwd)
-            if self.yolo_left:
-                self.yolo_left -= 1
-                self.ui.decision(tool_name, summary, "allow",
-                                 f"YOLO ({self.yolo_left} free calls left)")
-                return PermissionResultAllow()
-            return await self._spin_for(tool_name, summary)
+    def interrupt(self):
+        """Stop waiting for a spin (the user hit Ctrl-C)."""
+        if self._waiting is not None:
+            self._waiting.put_nowait({"type": "_interrupt"})
 
-    async def _spin_for(self, tool_name, summary):
+    async def spin_for_turn(self, prompt):
+        """Decide what Claude may do this turn. Returns the outcome, or None
+        if the user interrupted the wait."""
+        self.outcome = None
+        if self.yolo_left:
+            self.yolo_left -= 1
+            self.outcome = "yolo"
+            self.ui.free_turn(self.yolo_left)
+            return self.outcome
+        summary = " ".join(prompt.split())
         queue = self.machine.subscribe()
+        self._waiting = queue
         try:
             if not self.machine.connected.is_set():
                 self.ui.status(f"Waiting for the machine at {self.machine.url}...")
                 await self.machine.connected.wait()
             # Only a spin that starts after this point counts; one already
-            # under way could have been aimed before the request existed.
+            # under way could have been aimed before the prompt existed.
             floor = self.machine.last_spin_id
-            self.ui.request(tool_name, summary)
-            await self.machine.send({"type": "request", "tool": tool_name,
+            self.ui.request(prompt)
+            await self.machine.send({"type": "request", "tool": "prompt",
                                      "summary": summary})
             while True:
                 event = await queue.get()
+                if event["type"] == "_interrupt":
+                    self.ui.decision(None)
+                    return None
                 if event["spin_id"] <= floor:
                     continue
                 self.ui.event(event)
                 if event["type"] != "outcome":
                     continue
                 outcome = event["outcome"]
-                action, note = decide(outcome)
-                if action == "retry":
-                    self.ui.retry(outcome, event.get("reason"))
-                    floor = event["spin_id"]
+                if outcome not in ALLOW + ("deny", "deny_tests"):
+                    floor = event["spin_id"]  # replay, misread: pull again
                     continue
+                self.outcome = outcome
                 if outcome == "yolo":
-                    self.yolo_left = YOLO_CALLS
-                    note = f"YOLO: the next {YOLO_CALLS} calls are free"
-                if action == "deny":
-                    note = note.format(tool=tool_name)
-                self.ui.decision(tool_name, summary, action, note or outcome)
-                if action == "allow":
-                    return PermissionResultAllow()
-                return PermissionResultDeny(message=note)
+                    self.yolo_left = YOLO_PROMPTS
+                roast = random.choice(ROASTS) if outcome == "approve_roast" else None
+                self.ui.decision(outcome, roast)
+                return outcome
         finally:
+            self._waiting = None
             self.machine.unsubscribe(queue)
             await self.machine.send({"type": "done"})
+
+    def prompt_for(self, prompt):
+        """The prompt to send Claude, with what this turn allows in front."""
+        note = NOTES.get(self.outcome)
+        return f"{note}\n\n{prompt}" if note else prompt
+
+    async def can_use_tool(self, tool_name, tool_input, context):
+        if self.outcome in ALLOW:
+            return PermissionResultAllow()
+        if self.outcome == "deny_tests":
+            if is_test_call(tool_name, tool_input):
+                return PermissionResultAllow()
+            return PermissionResultDeny(message=TESTS_MESSAGE)
+        return PermissionResultDeny(message=DENY_MESSAGE)

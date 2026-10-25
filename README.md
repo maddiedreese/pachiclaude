@@ -2,16 +2,16 @@
 
 A real pachislot machine that decides Claude Code's tool permissions.
 
-The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislot. A 4K camera watches the reels from a few feet back, a Python + OpenCV loop reads where they stop, and the result approves or denies Claude's Write/Edit/Bash calls through the Agent SDK.
+The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislot. A 4K camera watches the reels from a few feet back, a Python + OpenCV loop reads where they stop, and after every prompt the spin decides what Claude may do that turn: its Write/Edit/Bash calls are approved or denied through the Agent SDK.
 
-| Reels | Outcome |
+| Reels | That prompt |
 |---|---|
-| 7-7-7 / BAR | YOLO: approve, and the next 5 calls are auto-approved |
+| 7-7-7 / BAR | YOLO: approved, and the next 5 prompts skip the spin |
 | Replay | Spin again |
-| Bell | Approve |
-| Watermelon | Deny: "write tests first" |
-| Cherry on reel 1 | Approve, with a roast |
-| Miss | Deny |
+| Bell | Approved: Claude may write files and run commands |
+| Watermelon | Write tests first: only test files and test runs |
+| Cherry on reel 1 | Approved, with a roast |
+| Miss | Denied: Claude can read and answer, but not change anything |
 | Misread | Spin again |
 
 ## Status
@@ -24,7 +24,7 @@ macOS, an Elgato Facecam 4K over USB, Python 3.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install opencv-python numpy websockets claude-agent-sdk
+.venv/bin/pip install opencv-python numpy websockets claude-agent-sdk rich
 ```
 
 The terminal app runs Claude Code through the Agent SDK, so it uses your existing Claude Code login.
@@ -44,13 +44,15 @@ In the other, from the repository Claude should work in:
 ~/pachiclaude/.venv/bin/python ~/pachiclaude/pachiclaude.py "add a --dry-run flag"
 ```
 
-Whenever Claude Code would ask permission (writing or editing a file, running a command), both terminals say what it wants and to pull the lever. The next spin decides, per the table above:
+It looks like the Claude Code CLI: `⏺` before Claude's messages and tool calls, `⎿` under results, the `✻` spinner and the boxed `>` input, with `/help`, `/status`, `/clear` and `/exit`.
 
-- Only a spin that starts after the request counts, so a spin already under way can't be aimed at it.
-- Replay and misread mean spin again, as often as it takes.
-- A denial goes back to Claude as the reason ("write tests first" on watermelon), so Claude can change course or try again.
-- YOLO approves this call and the next 5 without spinning.
-- Reading and searching don't need permission, so they never wait for the machine.
+As soon as you submit a prompt, a box like Claude Code's permission prompt shows it with three reels where "Do you want to proceed?" would be. Pull the lever: the reels spin with the real ones, lock as each one stops and light up the paying line, and the box stays in the transcript with the verdict (`✔ Approved: Claude may write and run things`, `bell on the up line · 2 spins`). Then Claude starts below it, and every permission it asks for that turn is answered from the spin, per the table above:
+
+- Only a spin that starts after the prompt counts, so a spin already under way can't be aimed at it.
+- Replay and misread mean spin again before Claude starts.
+- Claude is told what the spin allows along with every prompt, so on a miss or a watermelon it doesn't try things that will be denied (anything it tries anyway is denied with the reason), and after a win it knows an earlier denial no longer holds. Watermelon still allows writing test files (`tests/`, `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`) and running a test command (`pytest`, `npm test`, `go test`, ...) with nothing chained after it.
+- Reading and searching don't need permission, so they're never restricted.
+- Ctrl-C during a spin drops the prompt; while Claude works, it interrupts Claude.
 - Settings files aren't loaded: their allow rules would approve calls without asking the machine. `--use-settings` loads them anyway.
 
 Options: `--cwd` (where Claude works, default here), `--model` (default `claude-opus-5-5`), `--machine` (bridge URL, default `ws://127.0.0.1:47777`).
@@ -61,7 +63,7 @@ Options: `--cwd` (where Claude works, default here), `--model` (default `claude-
 
 ### The bridge
 
-`reel_watch.py` publishes every spin on a localhost WebSocket (`bridge.py`, port 47777, `--port` to change; `--no-serve` turns it off): `spin`, `stop` per reel, then `outcome` with the outcome, the reason and the nine symbols, or `false_spin`. Every event carries a `spin_id`, which is how the app tells new spins from old ones. Clients can send a `request` (tool and summary) for the machine's terminal to show, but only after the server's `hello` names the `pachiclaude/1` protocol, so nothing leaks to some other program that happens to hold the port.
+`reel_watch.py` publishes every spin on a localhost WebSocket (`bridge.py`, port 47777, `--port` to change; `--no-serve` turns it off): `spin`, `stop` per reel, then `outcome` with the outcome, the reason and the nine symbols, or `false_spin`. Every event carries a `spin_id`, which is how the app tells new spins from old ones. Clients can send a `request` (the prompt, as `summary`) for the machine's terminal to show, but only after the server's `hello` names the `pachiclaude/1` protocol, so nothing leaks to some other program that happens to hold the port.
 
 ## Capture a frame
 

@@ -220,15 +220,25 @@ class Reader:
         return True
 
     def read(self, frame, watcher):
-        """Return (outcome, reason, grid or None)."""
+        """Return (outcome, reason, grid or None, paying line or None)."""
         if not self.templates:
-            return "misread", "no templates", None
+            return "misread", "no templates", None, None
         if not self.locate(frame, watcher):
-            return "misread", "couldn't find the reels; recalibrate", None
+            return "misread", "couldn't find the reels; recalibrate", None, None
         crops = [frame[y0:y1, x0:x1] for _, (x0, y0, x1, y1) in watcher.boxes()]
         grid = read_reels.read_grid(crops, self.templates)
-        result, reason = read_reels.outcome(read_reels.symbols_only(grid))
-        return result, reason, grid
+        result, reason, line = read_reels.evaluate(read_reels.symbols_only(grid))
+        return result, reason, grid, line
+
+    def read_reel(self, frame, watcher, reel_id):
+        """The symbols one reel stopped on, top to bottom (None unread), from
+        the boxes as they are; the full read at settle re-finds the reels."""
+        if not self.templates:
+            return [None, None, None]
+        x0, y0, x1, y1 = dict(watcher.boxes())[reel_id]
+        crop = frame[y0:y1, x0:x1]
+        return [read_reels.classify(crop, row, self.templates)[0]
+                for row in range(3)]
 
 
 def open_source(video):
@@ -282,7 +292,7 @@ def main():
     if not args.no_serve:
         def on_request(request):
             if request.get("type") == "request":
-                print(f">>> Claude wants {request['tool']}: {request['summary']}"
+                print(f">>> New prompt: {request['summary']}"
                       "\n>>> Pull the lever!", flush=True)
         try:
             server = bridge.MachineServer(port=args.port,
@@ -315,7 +325,8 @@ def main():
                     if event[0] == "spin":
                         server.spin()
                     elif event[0] == "stop":
-                        server.stop(event[1])
+                        server.stop(event[1], reader.read_reel(
+                            frame, watcher, event[1]))
                     elif event[0] == "false_spin":
                         server.false_spin()
                 if event[0] == "spin":
@@ -323,7 +334,7 @@ def main():
                 elif event[0] == "stop":
                     print(f"  reel {event[1]} stopped")
                 elif event[0] == "settled":
-                    result, reason, grid = reader.read(frame, watcher)
+                    result, reason, grid, line = reader.read(frame, watcher)
                     msg = "SETTLED"
                     if not args.no_save:
                         msg += f" -> {save_settled(frame, watcher.boxes())}"
@@ -333,7 +344,7 @@ def main():
                     print(f"OUTCOME {result} ({reason})")
                     if server:
                         server.outcome(result, reason, grid and
-                                       read_reels.symbols_only(grid))
+                                       read_reels.symbols_only(grid), line)
                 elif event[0] == "false_spin":
                     print("FALSE SPIN (too short, ignored)")
     except KeyboardInterrupt:

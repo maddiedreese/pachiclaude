@@ -1,106 +1,35 @@
 #!/usr/bin/env python3
 """Claude Code, but a pachislot machine decides its tool permissions.
 
-Runs Claude Code through the Agent SDK. Whenever Claude Code would ask for
-permission (writing or editing files, running commands, ...), the request is
-sent to the machine over the bridge and the next spin decides: see gate.py
-for the outcome rules. Start reel_watch.py (or fake_machine.py) first.
+Runs Claude Code through the Agent SDK in a Claude Code-style terminal
+(tui.py). After each prompt you pull the lever, and the spin decides what
+Claude may do that turn (writing files, running commands, ...) before it
+starts: see gate.py for the outcome rules. Start reel_watch.py (or
+fake_machine.py) first.
 
-    pachiclaude.py                       chat until Ctrl-D
+    pachiclaude.py                          chat until Ctrl-D or /exit
     pachiclaude.py "add a --dry-run flag"   one task, then exit
 """
 import argparse
 import asyncio
 import os
+import signal
 import sys
 
 from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions,
                               ClaudeSDKClient, ResultMessage, TextBlock,
-                              ToolUseBlock)
+                              ToolResultBlock, ToolUseBlock, UserMessage)
+from rich.text import Text
 
 import bridge
-from gate import Gate, MachineClient, describe
+from gate import Gate, MachineClient
+from tui import TerminalUI
 
 MODEL = "claude-opus-5-5"
 
-SYMBOLS = {"red7": "7", "blue7": "7", "bar": "BAR", "replay": "REPLAY",
-           "bell": "BELL", "watermelon": "MELON", "cherry": "CHERRY",
-           None: "???"}
 
-
-def color(code, text):
-    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
-
-
-class TerminalUI:
-    def __init__(self, cwd):
-        self.cwd = cwd
-
-    def status(self, text):
-        print(color("2", f"[machine] {text}"), flush=True)
-
-    def request(self, tool, summary):
-        print(color("1;33", f"\n🎰 Claude wants {tool}: {summary}"))
-        print(color("33", "   Pull the lever!"), flush=True)
-
-    def event(self, event):
-        kind = event["type"]
-        if kind == "spin":
-            print(color("33", "   spinning..."), end="", flush=True)
-        elif kind == "stop":
-            print(color("33", f" {event['reel']}"), end="", flush=True)
-        elif kind == "false_spin":
-            print(color("2", "  (too short, spin again)"), flush=True)
-        elif kind == "outcome":
-            print(flush=True)
-            if event.get("grid"):
-                for row in range(3):
-                    print("   " + " ".join(f"{SYMBOLS.get(reel[row], reel[row]):>7}"
-                                           for reel in event["grid"]))
-
-    def retry(self, outcome, reason):
-        print(color("36", f"   {outcome}: spin again ({reason})"), flush=True)
-
-    def decision(self, tool, summary, action, note):
-        mark = color("1;32", "✔ allowed") if action == "allow" else color("1;31", "✘ denied")
-        print(f"   {mark} {tool}: {summary}")
-        if note:
-            print(color("2", f"   {note}"))
-        print(flush=True)
-
-    def message(self, msg):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock) and block.text.strip():
-                    print(block.text, flush=True)
-                elif isinstance(block, ToolUseBlock):
-                    summary = describe(block.name, block.input, self.cwd)
-                    print(color("2", f"→ {block.name}: {summary}"),
-                          flush=True)
-        elif isinstance(msg, ResultMessage):
-            cost = f", ${msg.total_cost_usd:.4f}" if msg.total_cost_usd else ""
-            print(color("2", f"[{msg.num_turns} turns{cost}]"), flush=True)
-
-
-async def prompts(task):
-    if task:
-        yield task
-        return
-    while True:
-        try:
-            line = await asyncio.to_thread(input, color("1", "\n> "))
-        except EOFError:
-            return
-        if line.strip():
-            yield line
-
-
-async def run(args):
-    ui = TerminalUI(args.cwd)
-    machine = MachineClient(args.machine, ui)
-    listener = asyncio.create_task(machine.run())
-    gate = Gate(machine, ui, args.cwd)
-    options = ClaudeAgentOptions(
+def options(args, gate):
+    return ClaudeAgentOptions(
         can_use_tool=gate.can_use_tool,
         permission_mode="default",
         model=args.model,
@@ -109,18 +38,110 @@ async def run(args):
         # machine, so by default none are loaded.
         setting_sources=["user", "project", "local"] if args.use_settings else [],
     )
+
+
+def show(ui, msg):
+    if isinstance(msg, AssistantMessage):
+        for block in msg.content:
+            if isinstance(block, TextBlock) and block.text.strip():
+                ui.assistant_text(block.text)
+            elif isinstance(block, ToolUseBlock):
+                ui.tool_use(block.id, block.name, block.input)
+    elif isinstance(msg, UserMessage) and isinstance(msg.content, list):
+        for block in msg.content:
+            if isinstance(block, ToolResultBlock):
+                ui.tool_result(block.tool_use_id, block.content, block.is_error)
+    elif isinstance(msg, ResultMessage):
+        ui.end_turn()
+        ui.done(msg.num_turns, msg.total_cost_usd)
+
+
+async def turn(client, ui, gate, prompt):
+    """Spin for one prompt, then run it. Ctrl-C during the spin drops the
+    prompt; during the run it interrupts Claude."""
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, gate.interrupt)
     try:
-        async with ClaudeSDKClient(options) as client:
-            async for prompt in prompts(args.task):
-                await client.query(prompt)
-                async for msg in client.receive_response():
-                    ui.message(msg)
+        outcome = await gate.spin_for_turn(prompt)
     finally:
+        loop.remove_signal_handler(signal.SIGINT)
+    if outcome is None:
+        return
+
+    interrupted = False
+
+    def on_sigint():
+        nonlocal interrupted
+        interrupted = True
+        asyncio.ensure_future(client.interrupt())
+
+    loop.add_signal_handler(signal.SIGINT, on_sigint)
+    ui.start_turn()
+    try:
+        await client.query(gate.prompt_for(prompt))
+        async for msg in client.receive_response():
+            show(ui, msg)
+    finally:
+        loop.remove_signal_handler(signal.SIGINT)
+        ui.end_turn()
+        if interrupted:
+            ui.interrupted()
+
+
+async def run(args):
+    ui = TerminalUI(args.cwd, args.model, args.machine)
+    machine = MachineClient(args.machine, ui)
+    gate = Gate(machine, ui, args.cwd)
+    ui.yolo_left = lambda: gate.yolo_left
+    listener = asyncio.create_task(machine.run())
+    ui.welcome()
+    client = ClaudeSDKClient(options(args, gate))
+    await client.connect()
+    try:
+        if args.task:
+            ui.print(Text(f"> {args.task}\n", "grey50"))
+            await turn(client, ui, gate, args.task)
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            # input() runs on a worker thread that Ctrl-C can't reach, and
+            # asyncio would wait for it on the way out: quit right here.
+            loop.add_signal_handler(signal.SIGINT, quit_now)
+            try:
+                prompt = await asyncio.to_thread(ui.read_prompt)
+            finally:
+                loop.remove_signal_handler(signal.SIGINT)
+            if prompt is None:
+                return
+            command = prompt.strip()
+            if not command:
+                continue
+            if command in ("/exit", "/quit"):
+                return
+            if command == "/help":
+                ui.help()
+            elif command == "/status":
+                ui.show_status()
+            elif command == "/clear":
+                await client.disconnect()
+                client = ClaudeSDKClient(options(args, gate))
+                await client.connect()
+                ui.print("  (new conversation)\n")
+            else:
+                await turn(client, ui, gate, prompt)
+    finally:
+        await client.disconnect()
         listener.cancel()
         try:
             await listener
         except asyncio.CancelledError:
             pass
+
+
+def quit_now():
+    sys.stdout.write("\x1b[2B\r\n")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 def main():
@@ -138,7 +159,8 @@ def main():
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
-        print()
+        pass  # Ctrl-C at the prompt quits
+    print()
 
 
 if __name__ == "__main__":

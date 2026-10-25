@@ -6,9 +6,13 @@ publishes JSON events to every connected client:
     {"type": "hello", "protocol": "pachiclaude/1", "spin_id": n,
      "spinning": bool}                                   on connect
     {"type": "spin", "spin_id": n}                       reels started
-    {"type": "stop", "spin_id": n, "reel": 1}            a reel stopped
+    {"type": "stop", "spin_id": n, "reel": 1,
+     "symbols": ["bell", "replay", None]}                a reel stopped (top to
+                                                         bottom; None unread)
     {"type": "outcome", "spin_id": n, "outcome": "approve", "reason": "...",
-     "grid": [["bell", ...], ...]}                       spin settled and read
+     "grid": [["bell", ...], ...], "line": "middle"}     spin settled and read;
+                                                         line is the paying
+                                                         line, if any
     {"type": "false_spin", "spin_id": n}                 too short, ignored
 
 Clients must check the hello's protocol before sending anything: another
@@ -72,13 +76,13 @@ class MachineServer:
         self.spinning = True
         self.publish({"type": "spin"})
 
-    def stop(self, reel):
-        self.publish({"type": "stop", "reel": reel})
+    def stop(self, reel, symbols=None):
+        self.publish({"type": "stop", "reel": reel, "symbols": symbols})
 
-    def outcome(self, outcome, reason, grid=None):
+    def outcome(self, outcome, reason, grid=None, line=None):
         self.spinning = False
         self.publish({"type": "outcome", "outcome": outcome, "reason": reason,
-                      "grid": grid})
+                      "grid": grid, "line": line})
 
     def false_spin(self):
         self.spinning = False
