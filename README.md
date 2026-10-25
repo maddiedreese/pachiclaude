@@ -6,7 +6,7 @@ The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislo
 
 | Reels | Outcome |
 |---|---|
-| 7-7-7 / BAR | YOLO: the next 5 calls are auto-approved |
+| 7-7-7 / BAR | YOLO: approve, and the next 5 calls are auto-approved |
 | Replay | Spin again |
 | Bell | Approve |
 | Watermelon | Deny: "write tests first" |
@@ -16,7 +16,7 @@ The machine is an unmodified, button-only *Matsuri no Tatsujin* (Taiko) pachislo
 
 ## Status
 
-Camera capture, stop detection, finding the reels after the camera moves, and reading the symbols work. The WebSocket bridge and the terminal app are next.
+Everything runs end to end: the camera watches the reels, reads each spin, and the terminal app runs Claude Code with the machine deciding its permissions.
 
 ## Setup
 
@@ -24,8 +24,44 @@ macOS, an Elgato Facecam 4K over USB, Python 3.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install opencv-python numpy
+.venv/bin/pip install opencv-python numpy websockets claude-agent-sdk
 ```
+
+The terminal app runs Claude Code through the Agent SDK, so it uses your existing Claude Code login.
+
+## Play
+
+Two terminals. In the one with camera access:
+
+```bash
+.venv/bin/python reel_watch.py
+```
+
+In the other, from the repository Claude should work in:
+
+```bash
+~/pachiclaude/.venv/bin/python ~/pachiclaude/pachiclaude.py               # chat, Ctrl-D to quit
+~/pachiclaude/.venv/bin/python ~/pachiclaude/pachiclaude.py "add a --dry-run flag"
+```
+
+Whenever Claude Code would ask permission (writing or editing a file, running a command), both terminals say what it wants and to pull the lever. The next spin decides, per the table above:
+
+- Only a spin that starts after the request counts, so a spin already under way can't be aimed at it.
+- Replay and misread mean spin again, as often as it takes.
+- A denial goes back to Claude as the reason ("write tests first" on watermelon), so Claude can change course or try again.
+- YOLO approves this call and the next 5 without spinning.
+- Reading and searching don't need permission, so they never wait for the machine.
+- Settings files aren't loaded: their allow rules would approve calls without asking the machine. `--use-settings` loads them anyway.
+
+Options: `--cwd` (where Claude works, default here), `--model` (default `claude-opus-5-5`), `--machine` (bridge URL, default `ws://127.0.0.1:47777`).
+
+### Without the machine
+
+`fake_machine.py` serves the same bridge from the keyboard: run it instead of `reel_watch.py`, then type `y` (approve), `n` (deny), `w` (watermelon), `c` (cherry), `7` (YOLO), `r` (replay) or `m` (misread) and Enter to play a spin. `--script approve,deny,...` answers each request automatically.
+
+### The bridge
+
+`reel_watch.py` publishes every spin on a localhost WebSocket (`bridge.py`, port 47777, `--port` to change; `--no-serve` turns it off): `spin`, `stop` per reel, then `outcome` with the outcome, the reason and the nine symbols, or `false_spin`. Every event carries a `spin_id`, which is how the app tells new spins from old ones. Clients can send a `request` (tool and summary) for the machine's terminal to show, but only after the server's `hello` names the `pachiclaude/1` protocol, so nothing leaks to some other program that happens to hold the port.
 
 ## Capture a frame
 
@@ -93,4 +129,5 @@ To teach it a symbol it gets wrong or doesn't know, label a capture's nine cells
 .venv/bin/python test_reel_watch.py   # stop detection: synthetic spins, bumps, flashes, real logs
 .venv/bin/python test_align.py        # finding the reels after moves, tilts and relighting
 .venv/bin/python test_read_reels.py   # labelled captures in fixtures/reels/ and the payline rules
+.venv/bin/python test_gate.py         # the bridge and the permission rules, with a real WebSocket and no Claude
 ```

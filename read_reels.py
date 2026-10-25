@@ -27,8 +27,11 @@ import align
 
 SYMBOLS = ("red7", "blue7", "bar", "replay", "bell", "watermelon", "cherry")
 # Three of these on a line auto-approves the next 5 calls, so a cell only
-# reads as one of them if matching on lightness agrees with chroma.
+# reads as one of them if matching on lightness also rates it within
+# LIGHTNESS_SLACK of its best symbol. Misaligned bells read as BAR were 0.28+
+# behind; a lamps-on red 7, which looks like a replay in gray, was 0.04.
 HIGH_STAKES = {"red7", "blue7", "bar"}
+LIGHTNESS_SLACK = 0.1
 ROW_NAMES = ("top", "middle", "bottom")
 ROW_CENTERS = (0.19, 0.52, 0.84)
 PATCH_HALF = (35, 22)  # (w, h) half-size of a template patch
@@ -99,8 +102,8 @@ def load_templates(directory=TEMPLATES_DIR):
     return templates
 
 
-def best_match(window, templates):
-    """Return (symbol, score, margin over the next symbol), unthresholded."""
+def scores(window, templates):
+    """Best score per symbol."""
     best = {}
     for symbol, tpl in templates:
         th, tw = tpl.shape[:2]
@@ -109,7 +112,13 @@ def best_match(window, templates):
         score = float(cv2.matchTemplate(window, tpl,
                                         cv2.TM_CCOEFF_NORMED).max())
         best[symbol] = max(best.get(symbol, -1.0), score)
-    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+    return best
+
+
+def best_match(window, templates):
+    """Return (symbol, score, margin over the next symbol), unthresholded."""
+    ranked = sorted(scores(window, templates).items(), key=lambda kv: kv[1],
+                    reverse=True)
     symbol, score = ranked[0]
     margin = score - (ranked[1][1] if len(ranked) > 1 else -1.0)
     return symbol, score, margin
@@ -126,9 +135,8 @@ def classify(crop, row, templates):
     if score < MIN_SCORE or margin < MIN_MARGIN:
         return None, score, margin
     if symbol in HIGH_STAKES:
-        second, _, _ = best_match(
-            lightness(crop)[rows], [(s, l) for s, _, l in templates])
-        if second != symbol:
+        light = scores(lightness(crop)[rows], [(s, l) for s, _, l in templates])
+        if light.get(symbol, -1.0) < max(light.values()) - LIGHTNESS_SLACK:
             return None, score, margin
     return symbol, score, margin
 

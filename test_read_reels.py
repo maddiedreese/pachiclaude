@@ -18,6 +18,8 @@ FULLY_READABLE = {
     "spin_20261024-154850_oldframing",  # no templates come from this one
     "spin_20261024-163627",
     "spin_20261024-163646_holdout",  # no templates come from this one
+    "spin_20261024-170043_red7_top",
+    "spin_20261024-170107_red7_holdout",  # no templates come from this one
 }
 
 

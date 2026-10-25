@@ -75,5 +75,27 @@
   "replay",
   "bell",
   "cherry"
+ ],
+ "spin_20261024-170043_red7_top": [
+  "red7",
+  "replay",
+  "watermelon",
+  "bar",
+  "bell",
+  "replay",
+  "replay",
+  "bell",
+  "cherry"
+ ],
+ "spin_20261024-170107_red7_holdout": [
+  "bell",
+  "watermelon",
+  "red7",
+  "blue7",
+  "bar",
+  "bell",
+  "cherry",
+  "replay",
+  "bell"
  ]
 }

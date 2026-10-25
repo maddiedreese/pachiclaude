@@ -21,6 +21,8 @@ seconds after it started is reported as a false spin instead of settling.
 At startup and on every settle the reels are located with align.py (so the
 boxes follow the camera if it moves) and read with read_reels.py, printing
 the nine symbols and the outcome. The settled frame is saved next to the crops.
+Every event is also published on the WebSocket bridge (bridge.py) for
+pachiclaude.py; --no-serve turns that off.
 
 Reads the Facecam by default, or a recorded clip with --video. Use --verbose
 to print the per-reel differences and tune the thresholds.
@@ -35,6 +37,7 @@ import cv2
 import numpy as np
 
 import align
+import bridge
 import read_reels
 from capture_4k import REELS_CONFIG, find_camera
 
@@ -258,6 +261,10 @@ def main():
                    help="reference diff above which the camera itself moved")
     p.add_argument("--min-spin", type=float, default=1.0,
                    help="seconds a spin must last to count")
+    p.add_argument("--port", type=int, default=bridge.PORT,
+                   help="port for the WebSocket bridge")
+    p.add_argument("--no-serve", action="store_true",
+                   help="don't publish events on the WebSocket bridge")
     p.add_argument("--no-save", action="store_true",
                    help="don't write settled reel crops to captures/")
     p.add_argument("--verbose", action="store_true",
@@ -271,6 +278,19 @@ def main():
                           args.still_frames, args.start_frames, args.shake,
                           args.min_spin, fps)
     reader = Reader()
+    server = None
+    if not args.no_serve:
+        def on_request(request):
+            if request.get("type") == "request":
+                print(f">>> Claude wants {request['tool']}: {request['summary']}"
+                      "\n>>> Pull the lever!", flush=True)
+        try:
+            server = bridge.MachineServer(port=args.port,
+                                          on_request=on_request).start()
+        except bridge.PortInUse as e:
+            cap.release()
+            sys.exit(str(e))
+        print(f"Serving events on ws://{bridge.HOST}:{args.port}")
     print("Watching reels (Ctrl-C to quit)")
     first = True
     try:
@@ -291,6 +311,13 @@ def main():
                       + ("  SHAKE" if watcher.shaking else "")
                       + ("  FLASH" if watcher.flashing else ""))
             for event in events:
+                if server:
+                    if event[0] == "spin":
+                        server.spin()
+                    elif event[0] == "stop":
+                        server.stop(event[1])
+                    elif event[0] == "false_spin":
+                        server.false_spin()
                 if event[0] == "spin":
                     print("SPIN")
                 elif event[0] == "stop":
@@ -304,12 +331,17 @@ def main():
                     if grid:
                         print(read_reels.format_grid(grid))
                     print(f"OUTCOME {result} ({reason})")
+                    if server:
+                        server.outcome(result, reason, grid and
+                                       read_reels.symbols_only(grid))
                 elif event[0] == "false_spin":
                     print("FALSE SPIN (too short, ignored)")
     except KeyboardInterrupt:
         pass
     finally:
         cap.release()
+        if server:
+            server.close()
 
 
 if __name__ == "__main__":
